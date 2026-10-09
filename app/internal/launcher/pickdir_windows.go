@@ -9,12 +9,15 @@ import (
 	"strings"
 )
 
-// pickDir 弹 Windows 的「浏览文件夹」窗口。
+// pickDir 弹 Windows 的「选择文件夹」窗口。
 //
-// 起始目录和标题走环境变量传,不拼进 PowerShell 脚本,免得路径里的引号出问题。
-// 先试 WinForms 的 FolderBrowserDialog(新版,能建新文件夹),它偶尔会报
-// "Unable to retrieve the root folder"(用户目录取不到时就会),这时退到
-// Shell.Application.BrowseForFolder(旧版树形对话框)。
+// 首选 IFileOpenDialog(FOS_PICKFOLDERS)—— 就是资源管理器同款的新对话框,
+// 并且把 owner 设成"用户点按钮那一刻的前台窗口"(一般是浏览器),这样它弹出来
+// 压在那个窗口上面、能抢回焦点;不带 owner 的话它会在所有窗口底下,
+// 用户得最小化全部窗口才找得到(老 WinForms FolderBrowserDialog 在
+// CREATE_NO_WINDOW 的子进程里还会退化成 XP 树形旧界面,两头都挨骂)。
+// 新对话框失败退 WinForms,再失败退 Shell.Application。
+// 起始目录和标题走环境变量传,不拼进脚本,免得路径里的引号出问题。
 // 用户取消时返回空字符串,不报错。
 func pickDir(ctx context.Context, from, title string) (string, error) {
 	if from == "" {
@@ -31,16 +34,100 @@ func pickDir(ctx context.Context, from, title string) (string, error) {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return "", ctx.Err()
 	case err != nil:
-		// 两种方式都不行:细节进日志,给网页一句能看懂的话
+		// 三种方式都不行:细节进日志,给网页一句能看懂的话
 		return "", errors.New(strings.TrimSpace(firstLine(errb.String())))
 	}
 	return absDir(strings.TrimSpace(out.String())), nil
 }
 
-// 成功就把选中的路径打到 stdout(取消则什么都不打);两种方式都失败时打 HZ_ERR: 开头的
-// 一行人话到 stdout,详细异常留在 stderr。
+// 成功把选中的路径打到 stdout(取消则不打);全失败时 stdout 打 HZ_ERR: 开头一行,
+// 详细异常留在 stderr。
 const pickScript = `
 $ErrorActionPreference = 'Stop'
+$modern = @'
+using System;
+using System.Runtime.InteropServices;
+public static class FolderPicker
+{
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [ComImport, Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    class FileOpenDialogRCW { }
+    [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IFileDialog
+    {
+        [PreserveSig] int Show(IntPtr hwndOwner);            // IModalWindow
+        void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+        void SetFileTypeIndex(uint iFileType);
+        void GetFileTypeIndex(out uint piFileType);
+        void Advise(IntPtr pfde, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOptions(uint fos);
+        void GetOptions(out uint pfos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem ppsi);
+        void GetCurrentSelection(out IShellItem ppsi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+        void AddPlace(IShellItem psi, int fdap);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+        void Close(int hr);
+        void SetClientGuid(ref Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr pFilter);
+        void GetResults(out IntPtr ppenum);
+        void GetItemType(out int pitm);
+    }
+    [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppvOut);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(int sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszDisplayName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern int SHCreateItemFromParsingName([MarshalAs(UnmanagedType.LPWStr)] string pszPath, IntPtr pbc, ref Guid riid, out IShellItem ppv);
+    public static string Select(string startPath, string title)
+    {
+        IFileDialog dlg = (IFileDialog)new FileOpenDialogRCW();
+        dlg.SetOptions(0x20 | 0x40);           // FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM
+        if (!string.IsNullOrEmpty(title)) dlg.SetTitle(title);
+        if (!string.IsNullOrEmpty(startPath) && System.IO.Directory.Exists(startPath))
+        {
+            IShellItem start = null;
+            Guid iid = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");
+            if (SHCreateItemFromParsingName(startPath, IntPtr.Zero, ref iid, out start) == 0) dlg.SetFolder(start);
+        }
+        // owner = 用户点按钮那一刻的前台窗口(一般是浏览器):弹窗压在上面、能抢回焦点。
+        // 没有有效前台窗口(自动化会话等)就用无 owner,Show 偶尔因 owner 出问题也退无 owner,
+        // 保证任何环境里都是新式对话框。
+        IntPtr owner = GetForegroundWindow();
+        if (owner != IntPtr.Zero && !IsWindow(owner)) owner = IntPtr.Zero;
+        int hr;
+        try { hr = dlg.Show(owner); }
+        catch (Exception) { if (owner == IntPtr.Zero) throw; hr = dlg.Show(IntPtr.Zero); }
+        if (hr == unchecked((int)0x800704C7)) return null;   // 用户取消
+        if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+        IShellItem item = null; dlg.GetResult(out item);
+        string path = null; item.GetDisplayName(unchecked((int)0x80028000), out path);   // SIGDN_FILESYSPATH
+        return path;
+    }
+}
+'@
+try {
+    Add-Type -TypeDefinition $modern
+    $p = [FolderPicker]::Select($env:HZ_PICK_START, $env:HZ_PICK_TITLE)
+    if ($p) { [Console]::Out.Write($p) }
+    exit 0
+} catch { [Console]::Error.WriteLine('现代选择器: ' + $_.Exception.Message) }
 try {
     Add-Type -AssemblyName System.Windows.Forms
     $d = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -49,18 +136,13 @@ try {
     if ($env:HZ_PICK_START -and (Test-Path -LiteralPath $env:HZ_PICK_START)) { $d.SelectedPath = $env:HZ_PICK_START }
     if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }
     exit 0
-} catch {
-    [Console]::Error.WriteLine($_.Exception.Message)
-}
+} catch { [Console]::Error.WriteLine('WinForms 选择器: ' + $_.Exception.Message) }
 try {
     $sh = New-Object -ComObject Shell.Application
-    # 0x41 = BIF_NEWDIALOGSTYLE + BIF_RETURNONLYFSDIRS;BIF_EDITBOX 让用户能直接敲路径
     $r = $sh.BrowseForFolder(0, $env:HZ_PICK_TITLE, 0x51, $env:HZ_PICK_START)
     if ($r) { [Console]::Out.Write($r.Self.Path) }
     exit 0
-} catch {
-    [Console]::Out.Write('HZ_ERR:')
-}
+} catch { [Console]::Out.Write('HZ_ERR:') }
 exit 1
 `
 

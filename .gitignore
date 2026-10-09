@@ -8,3 +8,5 @@ assets/preview/
 /dist/
 *.egg-info/
 !eval/**/*.jsonl
+# 本机构建/测试用的临时目录(Go 工具链、缓存、截图、冒烟产物)
+temp/

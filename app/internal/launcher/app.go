@@ -51,15 +51,19 @@ type engineInfo struct {
 type App struct {
 	opts     Options
 	cfg      Config
-	dataDir  string
+	dataDir  string // 运行目录:设置、日志、更新包
 	settings Settings
-	sys      SysInfo
-	backends []Backend
-	web      fs.FS
-	logger   *log.Logger
-	port     int
-	url      string
-	apiKey   string // llama-server 的访问密钥,每次启动随机生成,只有启动器的反代知道
+	// locModelDir:网页上设过的模型目录,空 = dataDir/models。指针文件 pointerDir 里记着。
+	locModelDir   string
+	pointerDir    string // location.json 放哪儿(被 --data-dir 钉死时为空)
+	dataDirLocked bool   // 运行目录由 --data-dir / HUMANIZER_DATA_DIR 固定,网页上不让改
+	sys           SysInfo
+	backends      []Backend
+	web           fs.FS
+	logger        *log.Logger
+	port          int
+	url           string
+	apiKey        string // llama-server 的访问密钥,每次启动随机生成,只有启动器的反代知道
 
 	rootCtx  context.Context
 	shutdown context.CancelFunc
@@ -93,9 +97,7 @@ func (a *App) logf(format string, args ...any) {
 
 func (a *App) settingsPath() string { return filepath.Join(a.dataDir, "settings.json") }
 
-func (a *App) modelPath(t Tier) string {
-	return filepath.Join(a.dataDir, "models", filepath.FromSlash(t.File))
-}
+// modelsDir 在 storage.go:模型目录可以改,默认是数据目录下的 models。
 
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
